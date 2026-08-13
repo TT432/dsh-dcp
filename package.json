@@ -1,0 +1,23 @@
+{
+  "name": "dsh-dcp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DCP (Dynamic Context Parallelism, SOSP'25) planning core for dsh: fine-grained blockwise context-parallel planning, hypergraph placement, division scheduling and roofline simulation.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-tools": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-llm": "^0.1.0-rc.6"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-tools": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-llm": "^0.1.0-rc.6"
+  }
+}
