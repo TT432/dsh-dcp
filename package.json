@@ -2,7 +2,7 @@
   "name": "dsh-dcp",
   "version": "0.1.0",
   "private": true,
-  "description": "DCP (Dynamic Context Parallelism, SOSP'25) planning core for dsh: fine-grained blockwise context-parallel planning, hypergraph placement, division scheduling and roofline simulation.",
+  "description": "LLM-DCP (Dynamic Compressing Prompts, arXiv:2504.11004) plugin for dsh: LLM as DCP-Agent, iterative MDP-style prompt/context compression.",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
