@@ -1,6 +1,7 @@
 // LLM-DCP 压缩核心测试：课程调度 / token 估算 / 提示词构造 / MDP 迭代（mock LLM）
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { BlockAssembler } from '@deepseek-ai/dsh-llm'
 import { compressWithAgent, buildCompressPrompt, curriculumRatio, estimateTokens } from '../lib/dcp/compress.js'
 
 // ---------- 课程调度 ----------
@@ -42,7 +43,6 @@ function makeMockLlm(script) {
   let i = 0
   return {
     BlockAssembler: MockAssembler,
-    createUserMessage: (m) => m,
     calls: [],
     stream: async function* (opts) {
       const text = typeof script === 'function' ? script(opts, i) : script[i % script.length]
@@ -52,6 +52,26 @@ function makeMockLlm(script) {
       if (text) yield { type: 'text-delta', index: 0, text }
       yield { type: 'block-end', index: 0, block: { type: 'text', text: text || '' } }
       yield { type: 'finish', reason: 'stop' }
+    },
+  }
+}
+
+// 真实 BlockAssembler + 0.2.x 的 StreamChunk 协议；用来验证插件组装的请求契约与
+// 真实分片（block-start/text-delta/block-end/usage/finish）能配合工作。
+function makeProtocolLlm(script, finishReason = { kind: 'stop' }) {
+  let i = 0
+  return {
+    BlockAssembler,
+    calls: [],
+    stream: async function* (opts) {
+      const text = typeof script === 'function' ? script(opts, i) : script[i % script.length]
+      this.calls.push(opts)
+      i++
+      yield { type: 'block-start', index: 0, blockType: 'text' }
+      if (text) yield { type: 'text-delta', index: 0, text }
+      yield { type: 'block-end', index: 0, block: { type: 'text', text: text || '' } }
+      yield { type: 'usage', usage: { inputTokens: 10, outputTokens: 5 } }
+      yield { type: 'finish', reason: finishReason }
     },
   }
 }
@@ -128,4 +148,47 @@ test('compressWithAgent：onStep 回调', async () => {
   })
   assert.deepEqual(seen, [1, 2])
   assert.ok(res.perStep.length === 2)
+})
+
+// ---------- 0.2.x 运行时契约（真实 BlockAssembler + StreamChunk） ----------
+test('compressWithAgent：真实 BlockAssembler 能消费标准分片协议', async () => {
+  const original = 'Real assembler protocol text. '.repeat(20)
+  const llm = makeProtocolLlm([
+    original.slice(0, Math.round(original.length * 0.7)),
+    original.slice(0, Math.round(original.length * 0.5)),
+  ])
+  stubCtx.llm = llm
+  const res = await compressWithAgent({ ctx: stubCtx, llm, text: original, targetRatio: 0.5, steps: 2 })
+  assert.equal(res.stepsUsed, 2)
+  assert.equal(llm.calls.length, 2)
+  assert.equal(res.text, original.slice(0, Math.round(original.length * 0.5)).trim())
+})
+
+test('compressWithAgent：请求使用 RequestUserInput（无 id/source）且无非法 purpose', async () => {
+  const original = 'Request contract text. '.repeat(10)
+  const llm = makeProtocolLlm([original.slice(0, Math.round(original.length * 0.5))])
+  stubCtx.llm = llm
+  await compressWithAgent({ ctx: stubCtx, llm, text: original, targetRatio: 0.5, steps: 1 })
+  const call = llm.calls[0]
+  // 0.2.x 的 GenerateOptions.messages 接受无身份的 RequestUserInput；
+  // MessageSource 只允许 user/model/tool/system-prompt，不能伪造 plugin kind。
+  assert.deepEqual(Object.keys(call.messages[0]).sort(), ['content', 'role'])
+  assert.equal(call.messages[0].role, 'user')
+  assert.equal(call.messages[0].id, undefined)
+  assert.equal(call.messages[0].source, undefined)
+  assert.equal(typeof call.system, 'string')
+  // purpose 在 0.2.x 是 'compaction' | 'session-title' 的封闭联合，普通插件调用不应设置。
+  assert.equal('purpose' in call, false)
+})
+
+test('compressWithAgent：真实 finish(kind=error) → 明确报错', async () => {
+  const llm = makeProtocolLlm(
+    ['irrelevant'],
+    { kind: 'error', failure: { message: 'auth failed', code: 'AUTH' } },
+  )
+  stubCtx.llm = llm
+  await assert.rejects(
+    compressWithAgent({ ctx: stubCtx, llm, text: 'hello world '.repeat(10), targetRatio: 0.5 }),
+    /llm call failed: auth failed/,
+  )
 })

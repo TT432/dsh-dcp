@@ -14,6 +14,10 @@
 
 ## 安装
 
+要求 dsh **0.2.1-rc.2 或更高的 0.2.x**（`peerDependencies` 声明为
+`@deepseek-ai/dsh-tools` / `@deepseek-ai/dsh-llm` `^0.2.1-rc.2`）。0.1.x 运行时会在启动期被
+dsh 的版本门禁禁用，请升级 dsh 后再装本版本。
+
 ```powershell
 # 0) 先在插件目录安装依赖（必须）：profile 通过 link: 引用插件，Node ESM 会
 #    realpath 到本目录解析 @deepseek-ai/* 导入；没有本地 node_modules 会报
@@ -34,7 +38,8 @@ dsh plugin --profile web add -w <path/to/dcp-plugin>
 ## 测试
 
 ```powershell
-node --test test\compress-tests.mjs  # LLM-DCP 压缩核心（mock LLM）
+# LLM-DCP 压缩核心 + dcp_compress 工具接线（mock LLM / 真实 BlockAssembler）
+node --test test\compress-tests.mjs test\tool-tests.mjs
 ```
 
 ## 实现说明
@@ -48,6 +53,10 @@ DCP-Agent 是逐 token 二分类策略网络（xlm-roberta-large + PPO + HPC 课
 - 每步校验（空输出/无进展/无减少）与提前终止（达标即停，避免过度压缩）。
 - 论文"不依赖黑盒 LLM 训练"的目标在推理端由 LLM 直接承担；dsh 未暴露 tokenizer，
   token 数为字符近似估算（英文≈4 字符/token，CJK 加权），压缩率控制以字符比例为准。
+- 与 dsh 0.2.x 的 LLM 契约对齐：一次性压缩请求使用无身份的 `RequestUserInput`
+  （`{role:'user', content}`，不伪造持久消息 id/source；`MessageSource` 没有 `plugin` 这个 kind）；
+  不再设置 `purpose`（0.2.x 是 `compaction | session-title` 的封闭联合）；
+  分片消费走真实的 `BlockAssembler`（`block-start` / `text-delta` / `block-end` / `usage` / `finish`）。
 - 官方仓库（Fhujinwu/DCP）在论文接收后才会更新代码，本实现基于论文 §IV 的方法重写。
 
 ## 参考
