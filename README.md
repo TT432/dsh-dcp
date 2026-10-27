@@ -1,65 +1,145 @@
-# dsh-dcp：LLM-DCP（Dynamic Compressing Prompts）的 dsh 插件
+# dsh-dcp：锚点上下文压缩 + LLM-DCP 提示词压缩
 
-以工具形式实现 **LLM-DCP**（[arXiv:2504.11004](https://ar5iv.labs.arxiv.org/html/2504.11004)）：
-把 prompt/上下文压缩建模为 MDP，用 LLM 充当 DCP-Agent 多步迭代压缩，保留关键信息。
+本插件包含两条独立能力线：
 
-> 历史说明：早期版本曾包含 DCP (SOSP'25, arXiv:2510.10620) 的 dcp_plan / dcp_benchmark 工具，
-> 现已移除；本插件当前只提供 dcp_compress（相关研究资料见 _research\dcp-official\）。
+1. **锚点压缩**：对齐本机 omp 的 dcp 扩展（`~/.omp/agent/extensions/dcp`，anchor mode），
+   由模型通过 `add_anchor` 与 `compress` 主动管理工作上下文。
+2. **LLM-DCP**（[arXiv:2504.11004](https://arxiv.org/abs/2504.11004)）：既有的
+   `dcp_compress` 工具，用可配置 LLM 充当 DCP-Agent 迭代压缩任意文本。
+   它不是 omp 对齐项，行为保持不变。
+
+锚点压缩的完整规格、前置/后置条件、不变量与异常行为见
+[`docs/anchor-compression.md`](./docs/anchor-compression.md)。
 
 ## 工具
 
-- **dcp_compress**（LLM-DCP）：用 ctx.llm 的可配置 LLM 充当 DCP-Agent，按论文 MDP 框架
-  **多步迭代压缩**长 prompt/上下文：逐步删除冗余、保留关键信息（实体/数字/标识符/指令要点），
-  目标压缩率随轨迹收紧（HPC 课程思想）。适合在调用长上下文模型前压缩提示词/文档/会话上下文。
+### `add_anchor({ anchor })`
+
+在当前对话位置放置具名锚点；锚点身份是该工具调用的 provider tool-call id。
+
+- 名字非空、不含空白、长度 ≤ 64；`session_start` 为保留名。
+- 名字在**整个会话内唯一**（包括已被压缩消耗的锚点），重复会报错。
+- `session_start` 是内置虚拟锚点，位于原始用户 prompt 之后；不需要标记消息。
+- 与 `compress` 一样，`add_anchor` 也必须是模型直接发起的工具调用；
+  `run_code` 子调用会报错，避免“返回成功但没有真正锚点”。
+
+### `compress({ startAnchor, summary, force? })`
+
+把从 `startAnchor` 到**本次 compress 调用之前**的上下文替换为模型自己写的技术摘要。
+
+```text
+prompt · work1 · add_anchor(a1) · work2 · work3 · compress(a1, summary)
+```
+
+压缩后模型看到：
+
+```text
+prompt · work1 · [Compressed: a1 → here] summary · compress(a1, summary) · 确认结果
+```
+
+- 起点锚点及其结果被消耗；compress 调用与确认结果保留，后续轮次知道压缩发生过。
+- 摘要由**替换节点**携带，落在 compress 调用之前。
+- 链式压缩的摘要按序累积；跨越旧压缩时会吸收旧摘要，模型应把其要点并入新摘要。
+- `startAnchor: "session_start"` 必须同时传 `force: true`，防止误删工作上下文。
+- 未知锚点、空区间、已消耗锚点、缺少 `force`、跨 system-prompt 更新、经
+  `run_code` 子调用等情况都会报错，且不产生任何会话事件；错误会列出可用锚点。
+- `run_code` 子调用不能压缩：区间终点必须是模型直接发起的 compress 调用。
+
+**持久化语义**：dsh 的 loop 请求是会话日志的纯函数，不能像 omp 一样只改请求副本。
+因此本插件使用 dsh 官方的 surface replacement 机制：只追加事件，不删除或改写原始日志；
+被压缩区间仅从派生给模型的历史中遮蔽，resume 后仍保持压缩结果。
+替换前紧邻追加 `compaction/prune` 影子计价事件，保证上下文占用投影同步下降。
+
+### `dcp_compress`
+
+既有 LLM-DCP 工具：多步迭代压缩 prompt/文档/会话文本，支持 `targetRatio`、`steps`、
+`keyPoints` 与 provider/model 覆盖。与上面的锚点压缩不是同一能力。
+
+## 配置（仅环境变量，无配置文件）
+
+| 变量 | 含义 |
+| --- | --- |
+| `DCP_REMIND_THRESHOLD` | 超阈值提醒。缺省 `0.6`；`(0,1)` 为上下文窗口比例，`>=1` 为绝对 token 数，`<=0` 关闭。 |
+| `DCP_DEBUG` | 非空且非 `0/false/off/no` 时，写 `$DSH_HOME/logs/dcp/dcp.log` 与 `context-<session>.jsonl`。 |
+
+提醒在 `agent/pre-step` 注入，列出当前可用锚点并要求立即 `compress`。
+与 omp 不同，dsh 的提醒是普通 `user/message` 事件，会持久化，因此**每个 turn 至多一次**。
+缺省阈值取 `0.6` 而非 omp 的 `0.8`，是为了让模型驱动压缩先于 dsh 自动 compaction
+（后者压力预算约为 `0.8 × (window − 输出预留 − 64k headroom)`）。
+
+压缩需要 `ctx.tokenMeter`（dsh-base 默认挂载）计算影子价格；服务缺席时明确报错，
+不会静默造成上下文占用漂移。
 
 ## 安装
 
-要求 dsh **0.2.1-rc.2 或更高的 0.2.x**（`peerDependencies` 声明为
-`@deepseek-ai/dsh-tools` / `@deepseek-ai/dsh-llm` `^0.2.1-rc.2`）。0.1.x 运行时会在启动期被
-dsh 的版本门禁禁用，请升级 dsh 后再装本版本。
+要求 dsh **0.2.1-rc.2 或更高的 0.2.x**（peer 为 `@deepseek-ai/dsh-tools` /
+`@deepseek-ai/dsh-llm` / `@deepseek-ai/dsh-session` / `@deepseek-ai/dsh-token-meter`
+`^0.2.1-rc.2`；本机开发/测试对齐 **0.2.1-rc.3**）。
 
 ```powershell
-# 0) 先在插件目录安装依赖（必须）：profile 通过 link: 引用插件，Node ESM 会
-#    realpath 到本目录解析 @deepseek-ai/* 导入；没有本地 node_modules 会报
-#    ERR_MODULE_NOT_FOUND: Cannot find package '@deepseek-ai/dsh-tools'
+# 0) 在插件目录安装依赖（link: 插件需要自己的 node_modules）
 npm install
 
-# 1) 安装到 web profile（profile 是 pnpm workspace 根，需 -w 标志）
+# 1) 安装到目标 profile（web/desktop 均按 workspace 根处理，需 -w）
 dsh plugin --profile web add -w <path/to/dcp-plugin>
+# desktop 也可：
+dsh plugin --profile desktop add -w <path/to/dcp-plugin>
 
-# 2) 在 ~\.dsh\profiles\web\cordis.patch.yml 追加：
+# 2) 在对应 profile 的 cordis.patch.yml 追加（已有则无需重复）：
 # - insert:
 #     - id: dsh-dcp
 #       name: 'dsh-dcp'
 ```
 
-新装依赖后需重启 web 服务；改 patch 会热重载。
+新装依赖后需重启对应应用；修改 patch 会热加载。已链接的源码发生变更时，
+本机 desktop 实测可热更新宿主侧工具。
 
 ## 测试
 
 ```powershell
-# LLM-DCP 压缩核心 + dcp_compress 工具接线（mock LLM / 真实 BlockAssembler）
-node --test test\compress-tests.mjs test\tool-tests.mjs
+node --test test\compress-tests.mjs test\tool-tests.mjs test\anchor-tests.mjs test\anchor-tool-tests.mjs test\remind-tests.mjs
 ```
 
-## 实现说明
+覆盖：LLM-DCP 既有回归、锚点扫描与唯一性、`session_start`、区间替换、链式累积、
+吸收、空区间/未知/已消耗锚点、system-prompt 更新保护、影子计价、提醒阈值与节流、
+工具注册与参数校验。当前共 **52 项测试**。
 
-论文把 prompt 压缩建模为 MDP（状态=压缩中 prompt；动作=逐 token 保留/删除；奖励=压缩率+关键信息保留−输出分布差异−越界惩罚），
-DCP-Agent 是逐 token 二分类策略网络（xlm-roberta-large + PPO + HPC 课程训练）。
-本插件在 dsh 中的等价实现（**LLM-as-DCP-Agent**）：
-- 用 ctx.llm 的可配置 LLM 充当策略网络，按 MDP 框架迭代多步（每步基于上一步的动态上下文）；
-- 目标压缩率随轨迹逐步收紧（HPC 课程思想：从宽松到严格）；
-- 关键信息保留：压缩指令显式要求保留实体/数字/标识符/指令 + 用户可指定 must-keep 要点；
-- 每步校验（空输出/无进展/无减少）与提前终止（达标即停，避免过度压缩）。
-- 论文"不依赖黑盒 LLM 训练"的目标在推理端由 LLM 直接承担；dsh 未暴露 tokenizer，
-  token 数为字符近似估算（英文≈4 字符/token，CJK 加权），压缩率控制以字符比例为准。
-- 与 dsh 0.2.x 的 LLM 契约对齐：一次性压缩请求使用无身份的 `RequestUserInput`
-  （`{role:'user', content}`，不伪造持久消息 id/source；`MessageSource` 没有 `plugin` 这个 kind）；
-  不再设置 `purpose`（0.2.x 是 `compaction | session-title` 的封闭联合）；
-  分片消费走真实的 `BlockAssembler`（`block-start` / `text-delta` / `block-end` / `usage` / `finish`）。
-- 官方仓库（Fhujinwu/DCP）在论文接收后才会更新代码，本实现基于论文 §IV 的方法重写。
+实机验证（desktop profile，子代理独立会话）：模型依次调用 `add_anchor`、`read`、
+`compress`，会话日志确认：
+
+```text
+seq 28  compaction/prune   shadowedRange 18–22, shadowedTokenCount 2268
+seq 29  user/message       replace 18–22, [Compressed: e2e-anchor → here] ...
+seq 30  tool/result        compress 确认：3 message(s) elided，并报告净释放 token 估算
+```
+
+返回的 `freedTokens` 按 `shadowedTokenCount − 摘要节点估算 token` 计算（下限为 0），
+不是把被遮蔽区间的总量误报为净释放量。
+
+原始 add_anchor/read 事件仍在日志中；派生上下文只保留摘要、compress 调用与确认结果。
+同一子会话随后执行第二次压缩（`e2e-final-2`）时，首个 `[Compressed: e2e-final → here]`
+摘要仍保留，返回 `4 message(s) elided, ~628 tokens freed`，验证链式累积。
+
+## 实现结构
+
+```text
+lib/index.js             插件入口：注册 3 个工具与提醒监听
+lib/anchor/anchors.js    表面节点/锚点扫描、名字校验、session_start
+lib/anchor/compress.js   区间解析、校验、影子计价 + 替换提交
+lib/anchor/prompts.js    工具描述、摘要与提醒文本
+lib/anchor/remind.js     阈值、token 估算、agent/pre-step 提醒与 turn-stopping 收尾抑制
+lib/anchor/logger.js     DCP_DEBUG 文件日志与 cordis logger
+lib/tools/anchor.js      add_anchor / compress 工具接线
+lib/dcp/compress.js      既有 LLM-DCP 核心
+lib/tools/compress.js    既有 dcp_compress 工具
+```
+
+与 omp 的刻意差异（完整清单见规格文档）：压缩是持久的 append-only 表面替换；
+不注入 `session_start` 标记消息；提醒会持久化且每 turn 至多一次；缺省提醒阈值为 `0.6`；
+in-history system-prompt 更新不可被压缩区间遮蔽。
 
 ## 参考
 
+- 对齐基准：`~/.omp/agent/extensions/dcp`（README、docs/design.md、src/*）。
+- 规格：[`docs/anchor-compression.md`](./docs/anchor-compression.md)。
 - LLM-DCP：https://arxiv.org/abs/2504.11004 · 官方仓库（暂无代码）：https://github.com/Fhujinwu/DCP
-- DCP (SOSP'25)：https://arxiv.org/abs/2510.10620（规划工具已移除，研究资料见 _research\dcp-official\）

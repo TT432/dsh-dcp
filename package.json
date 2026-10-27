@@ -1,8 +1,8 @@
 {
   "name": "dsh-dcp",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
-  "description": "LLM-DCP (Dynamic Compressing Prompts, arXiv:2504.11004) plugin for dsh: LLM as DCP-Agent, iterative MDP-style prompt/context compression.",
+  "description": "Anchor-based model-driven context compression (aligned with omp dcp) plus LLM-DCP prompt compression for DeepSeek Harness.",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
@@ -13,11 +13,15 @@
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.5",
     "@deepseek-ai/dsh-llm": "^0.2.1-rc.2",
+    "@deepseek-ai/dsh-session": "^0.2.1-rc.2",
+    "@deepseek-ai/dsh-token-meter": "^0.2.1-rc.2",
     "@deepseek-ai/dsh-tools": "^0.2.1-rc.2"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.5",
-    "@deepseek-ai/dsh-llm": "^0.2.1-rc.2",
-    "@deepseek-ai/dsh-tools": "^0.2.1-rc.2"
+    "@deepseek-ai/dsh-llm": "0.2.1-rc.3",
+    "@deepseek-ai/dsh-session": "0.2.1-rc.3",
+    "@deepseek-ai/dsh-token-meter": "0.2.1-rc.3",
+    "@deepseek-ai/dsh-tools": "0.2.1-rc.3"
   }
 }
