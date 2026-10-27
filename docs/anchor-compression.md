@@ -196,8 +196,9 @@ starting any new work.
 - **NFR-2 原子性**：所有校验在任何 append 之前完成。若替换被拒，已追加的
   `compaction/prune` 是一个孤立的影子计价记录——下一次事件会使其过期，
   不影响重建（INV-4 的弱化说明）。
-- **NFR-3 压缩后上下文占用即时下降**：影子计价使 token-meter 的
-  `contextPressure.projectedTokens` 扣减被遮蔽区间、加上摘要节点。
+- **NFR-3 上下文占用投影不漂移**：影子计价使 token-meter 的
+  `contextPressure.projectedTokens` 扣减被遮蔽区间、加上摘要节点；
+  净变化为 `shadowedTokens − summaryTokens`，不要求摘要必然更短。
 - **NFR-4 与 compaction 共存**：不注册 compaction 事件括号；`/compact` 或其他
   压缩遮蔽本插件的摘要节点时，不需要任何清理逻辑（无独立状态）。
 - **NFR-5 测试**：`node --test test/*.mjs` 全绿；既有 LLM-DCP 测试不回归。

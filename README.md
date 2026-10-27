@@ -48,7 +48,8 @@ prompt · work1 · [Compressed: a1 → here] summary · compress(a1, summary) ·
 **持久化语义**：dsh 的 loop 请求是会话日志的纯函数，不能像 omp 一样只改请求副本。
 因此本插件使用 dsh 官方的 surface replacement 机制：只追加事件，不删除或改写原始日志；
 被压缩区间仅从派生给模型的历史中遮蔽，resume 后仍保持压缩结果。
-替换前紧邻追加 `compaction/prune` 影子计价事件，保证上下文占用投影同步下降。
+替换前紧邻追加 `compaction/prune` 影子计价事件，保证上下文占用投影按
+「被遮蔽区间 − 摘要节点」正确更新，不发生漂移。
 
 ### `dcp_compress`
 
