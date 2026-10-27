@@ -10,7 +10,7 @@ import {
 } from '../lib/anchor/anchors.js'
 import { compressFromAnchor, recordAnchor } from '../lib/anchor/compress.js'
 import { estimateMessage } from '@deepseek-ai/dsh-token-meter/estimate'
-import { createSystemMessage } from '@deepseek-ai/dsh-llm'
+import { createSystemMessage, createUserMessage } from '@deepseek-ai/dsh-llm'
 import {
   appendAssistant,
   appendToolResult,
@@ -61,6 +61,46 @@ test('firstUserEntryIndex：第一条 user 消息即原始 prompt', () => {
   assert.equal(entries[firstUserEntryIndex(entries)].message.content[0].text, 'Original user prompt')
 })
 
+test('firstUserEntryIndex：优先 source.kind=user，session_start 保留真正 prompt', () => {
+  const session = createSession('prompt-source-priority')
+  appendSystem(session)
+  session.append('user/message', createUserMessage({
+    content: [{ type: 'text', text: 'INJECTED CONTEXT' }],
+    source: { kind: 'runtime-context' },
+  }), { surfaceOp: 'append' })
+  appendPrompt(session, 'REAL PROMPT')
+  const entriesBefore = entriesOf(session)
+  assert.equal(firstUserEntryIndex(entriesBefore), 2)
+
+  const anchorStep = appendAssistant(session, {
+    turn: 2,
+    step: 1,
+    calls: [{ callId: 'call-anchor-1', name: 'add_anchor', args: { anchor: 'a1' } }],
+  })
+  appendToolResult(session, { turn: 2, step: 1, callId: 'call-anchor-1', callSeq: anchorStep.callSeqs.get('call-anchor-1') })
+  appendAssistant(session, { turn: 3, step: 1, text: 'WORK' })
+  appendAssistant(session, {
+    turn: 4,
+    step: 1,
+    calls: [{ callId: 'call-compress-1', name: 'compress', args: {} }],
+  })
+  const result = compressFromAnchor({
+    session,
+    tokenMeter,
+    startAnchor: 'session_start',
+    summary: 'S',
+    force: true,
+    callId: 'call-compress-1',
+    logger: silentLogger,
+  })
+  assert.equal(result.shadowedMessages, 3)
+  const shape = derivedShape(session)
+  assert.deepEqual(shape.map((m) => m.role), ['system', 'user', 'user', 'user', 'assistant'])
+  assert.equal(shape[1].text, 'INJECTED CONTEXT')
+  assert.equal(shape[2].text, 'REAL PROMPT')
+  assert.equal(shape[3].text, '[Compressed: session_start → here]\nS')
+})
+
 test('validateAnchorName：空/空白/超长/保留名', () => {
   assert.equal(validateAnchorName(' a1 '), 'a1')
   assert.throws(() => validateAnchorName('   '), /must not be empty/)
@@ -68,6 +108,18 @@ test('validateAnchorName：空/空白/超长/保留名', () => {
   assert.throws(() => validateAnchorName('x'.repeat(65)), /too long/)
   assert.throws(() => validateAnchorName('session_start'), /reserved/)
   assert.throws(() => validateAnchorName(42), /string "anchor"/)
+})
+
+test('失败的非法 add_anchor 不会成为可用锚点或被压缩起点', () => {
+  for (const badName of ['a 1', 'x'.repeat(65)]) {
+    const { session, anchorCallId, compressCallId } = buildAnchorScenario({ anchorName: badName })
+    assert.throws(() => recordAnchor({ session, anchor: badName, callId: anchorCallId }))
+    assert.deepEqual(scanLiveAnchors(entriesOf(session)).map((a) => a.name), ['session_start'])
+    assert.throws(
+      () => compressFromAnchor({ session, tokenMeter, startAnchor: badName, summary: 'S', callId: compressCallId, logger: silentLogger }),
+      /unknown startAnchor/,
+    )
+  }
 })
 
 test('recordAnchor：本调用自身不算重复，其他同名（含已消耗）拒绝', () => {

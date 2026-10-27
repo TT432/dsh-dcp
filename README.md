@@ -102,7 +102,7 @@ node --test test\compress-tests.mjs test\tool-tests.mjs test\anchor-tests.mjs te
 
 覆盖：LLM-DCP 既有回归、锚点扫描与唯一性、`session_start`、区间替换、链式累积、
 吸收、空区间/未知/已消耗锚点、system-prompt 更新保护、影子计价、提醒阈值与节流、
-工具注册与参数校验。当前共 **52 项测试**。
+工具注册与参数校验。当前共 **54 项测试**。
 
 实机验证（desktop profile，子代理独立会话）：模型依次调用 `add_anchor`、`read`、
 `compress`，会话日志确认：

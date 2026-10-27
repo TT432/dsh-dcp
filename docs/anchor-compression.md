@@ -66,6 +66,8 @@ dsh 的官方等价机制是 **surface replacement**（compaction 用的同一�
   - `session_start` 为保留名；
   - 名字在**整个会话**内唯一：扫描日志中所有 `add_anchor` 调用（含已被
     压缩消耗的），排除本次调用自身的 `toolCallId`。
+- 历史扫描与工具校验共用同一名字规范：非法/失败的 `add_anchor` 不会成为
+  可用锚点，也不能作为压缩起点或被提醒列出。
 - 成功：返回确认文本，提示后续以 `startAnchor` 引用；锚点身份是
   provider 分配的 `tool-call.id`（全局唯一、持久）。
 - 必须由模型直接调用；`run_code` 子调用没有模型可见的 tool-call 节点，
@@ -243,9 +245,10 @@ starting any new work.
 
 ## 9. 验收
 
-- 单元/集成测试覆盖：锚点扫描、add_anchor 校验、session_start、链式累积、
-  吸收、空区间、未知/已消耗锚点、force、system-prompt 更新保护、影子计价数值、
-  提醒阈值与节流。
+- 单元/集成测试覆盖：锚点扫描、add_anchor 校验、非法调用不可解析、
+  `source.kind === 'user'` 的 prompt 优先级、session_start、链式累积、
+  吸收、空区间、未知/已消耗锚点、force、system-prompt 更新保护、空表面节点、
+  影子计价、提醒阈值与节流。
 - 实机：插件在 desktop/web profile 加载后 `add_anchor` / `compress` 出现在工具表；
   子代理会话中模型调用 `compress` 后，日志中 `compaction/prune` 与替换事件相邻、
   `deriveMessages()` 只含摘要节点与 compress 调用/结果，确认返回报告释放的 token 数。
