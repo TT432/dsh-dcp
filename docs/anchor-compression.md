@@ -145,7 +145,7 @@ dsh 的官方等价机制是 **surface replacement**（compaction 用的同一�
 
 环境变量 `DCP_REMIND_THRESHOLD`：
 
-- 缺省 `0.6`；
+- 缺省 `0.4`；
 - `(0,1)`：上下文窗口的比例；
 - `>= 1`：绝对 token 数；
 - `<= 0` / 非法：`<=0` 关闭，非法按缺省。
@@ -238,8 +238,8 @@ starting any new work.
 3. 锚点名唯一性是「整会话」而非「存活锚点」——与 omp 一致；差异在于 omp
    从持久 branch 扫描，dsh 从事件日志扫描。
 4. 提醒会持久化，且每 turn 至多一次（omp 每请求一次、不持久化）。
-5. 缺省提醒阈值 `0.6` 而非 `0.8`：dsh 默认启用自动 compaction，其压力阈值约为
-   `0.8 × (window − 输出预留 − 64k headroom)`；`0.6` 让模型驱动压缩先于自动
+5. 缺省提醒阈值 `0.4` 而非 `0.8`：dsh 默认启用自动 compaction，其压力阈值约为
+   `0.8 × (window − 输出预留 − 64k headroom)`；`0.4` 让模型驱动压缩先于自动
    compaction。可通过环境变量覆盖。
 6. 需要 `ctx.tokenMeter`（dsh-base 默认挂载）；缺席时 compress 明确拒绝。
 7. 额外的 dsh 安全约束：in-history 的 system-prompt 更新不可被压缩区间遮蔽。

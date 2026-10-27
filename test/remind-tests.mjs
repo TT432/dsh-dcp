@@ -52,6 +52,7 @@ async function runPreStep(handler, { session, turn = 1, step = 1, messages = [] 
 }
 
 test('parseRemindThreshold：缺省/数值/非法/关闭', () => {
+  assert.equal(DEFAULT_REMIND_THRESHOLD, 0.4)
   assert.equal(parseRemindThreshold(undefined), DEFAULT_REMIND_THRESHOLD)
   assert.equal(parseRemindThreshold(''), DEFAULT_REMIND_THRESHOLD)
   assert.equal(parseRemindThreshold('abc'), DEFAULT_REMIND_THRESHOLD)

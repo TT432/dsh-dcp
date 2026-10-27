@@ -60,12 +60,12 @@ prompt · work1 · [Compressed: a1 → here] summary · compress(a1, summary) ·
 
 | 变量 | 含义 |
 | --- | --- |
-| `DCP_REMIND_THRESHOLD` | 超阈值提醒。缺省 `0.6`；`(0,1)` 为上下文窗口比例，`>=1` 为绝对 token 数，`<=0` 关闭。 |
+| `DCP_REMIND_THRESHOLD` | 超阈值提醒。缺省 `0.4`；`(0,1)` 为上下文窗口比例，`>=1` 为绝对 token 数，`<=0` 关闭。 |
 | `DCP_DEBUG` | 非空且非 `0/false/off/no` 时，写 `$DSH_HOME/logs/dcp/dcp.log` 与 `context-<session>.jsonl`。 |
 
 提醒在 `agent/pre-step` 注入，列出当前可用锚点并要求立即 `compress`。
 与 omp 不同，dsh 的提醒是普通 `user/message` 事件，会持久化，因此**每个 turn 至多一次**。
-缺省阈值取 `0.6` 而非 omp 的 `0.8`，是为了让模型驱动压缩先于 dsh 自动 compaction
+缺省阈值取 `0.4` 而非 omp 的 `0.8`，是为了让模型驱动压缩先于 dsh 自动 compaction
 （后者压力预算约为 `0.8 × (window − 输出预留 − 64k headroom)`）。
 
 压缩需要 `ctx.tokenMeter`（dsh-base 默认挂载）计算影子价格；服务缺席时明确报错，
@@ -136,7 +136,7 @@ lib/tools/compress.js    既有 dcp_compress 工具
 ```
 
 与 omp 的刻意差异（完整清单见规格文档）：压缩是持久的 append-only 表面替换；
-不注入 `session_start` 标记消息；提醒会持久化且每 turn 至多一次；缺省提醒阈值为 `0.6`；
+不注入 `session_start` 标记消息；提醒会持久化且每 turn 至多一次；缺省提醒阈值为 `0.4`；
 in-history system-prompt 更新不可被压缩区间遮蔽。
 
 ## 参考
