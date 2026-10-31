@@ -211,6 +211,13 @@ dsh 的官方等价机制是 **surface replacement**（compaction 用的同一�
 触发方式：`agent/pre-step` 瀑布——先 `await next()`（保留运行时上下文注入），
 在 `decision.kind === 'enter'` 且未取消时检查；命中后把提醒 `UserMessage`
 追加到 `decision.messages`。同一会话同一 turn 最多一条。
+
+**10% 档位（token 提醒）**：`[dcp:context]` 只在上下文每增长 10% 时提醒一次
+（`tokenBracket = floor(tokens / (window ?? budget) × 10)`）。档位锚点是表面最近一条
+token 提醒的估算值（提醒事件持久在日志里，`source.tokens` 可读回），因此不新增持久状态；
+该提醒之后的 `compress` 调用或更低的新估算值视为重置。omp 把档位写进 `dcp-state`，
+是因为它的提醒按请求重算；dsh 的提醒本身就是持久事件，可直接用作档位锚点。
+档位抑制只影响 token 提醒本身，被抑制的 turn 仍可命中 unit / budget 触发。
 另注册 `agent/turn-stopping` 只读标记：若该 turn 正在收尾且没有新消息，
 不注入提醒、不多驱动一次模型；标记只消费一次，不妨碍 steering 后的继续 step。
 
@@ -301,8 +308,9 @@ any new work. Do not reach for "session_start" as a shortcut: ...
 8. 工具调用预算按「表面最近一次 compress 调用」计数，而非 omp 的持久水位
    （`toolCallMark`）：dsh 拒绝 `run_code` 子调用压缩，compress 调用必然在表面上，
    扫描是精确的；omp 的 eval-kernel 绕过路径在 dsh 不存在。
-9. token 提醒不做 10% 档位游标：dsh 的提醒是持久事件，已用「每 turn 至多一条」
-   节流；再叠档位没有增量收益。
+9. token 提醒的 10% 档位不依赖持久状态：档位从表面最近一条 token 提醒的估算值推导，
+   其后的压缩或估算回落视为重置。omp 把档位写进 `dcp-state`，是因为它的提醒按请求
+   重算；dsh 的提醒本身持久在日志中，可直接用作档位锚点。
 10. dsh 无 stale usage 问题：`estimateContextTokens` 优先使用
     `tokenMeter.measure(session)`，它按当前表面（含影子计价替换）重新计价，
     不会锚定压缩前的旧 usage。
@@ -313,7 +321,7 @@ any new work. Do not reach for "session_start" as a shortcut: ...
   `source.kind === 'user'` 的 prompt 优先级、session_start、链式累积、
   吸收、空区间、未知/已消耗锚点、force、system-prompt 更新保护、空表面节点、
   影子计价、摘要槽位/证据/严格层、基线继承、三类提醒的触发/优先级/节流、
-  工具注册与参数校验。
+  token 提醒的 10% 档位与重置、工具注册与参数校验。
 - 实机：插件在 desktop/web profile 加载后 `add_anchor` / `compress` 出现在工具表；
   子代理会话中模型调用 `compress` 后，日志中 `compaction/prune` 与替换事件相邻、
   `deriveMessages()` 只含摘要节点与 compress 调用/结果，确认返回报告释放的 token 数。

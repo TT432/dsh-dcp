@@ -11,12 +11,14 @@ import {
   estimateContextTokens,
   finishedTodoSet,
   heuristicContextTokens,
+  lastTokenReminder,
   parseRemindPolicy,
   parseRemindThreshold,
   parseToolcallBudget,
   registerReminder,
   remindBudget,
   resolveContextWindow,
+  tokenBracket,
   toolCallsSinceLastCompress,
 } from '../lib/anchor/remind.js'
 import {
@@ -27,6 +29,7 @@ import {
   appendToolResult,
   createSession,
 } from './helpers.mjs'
+import { surfaceEntries } from '../lib/anchor/anchors.js'
 
 const silentLogger = { info() {}, debug() {}, warn() {}, error() {}, saveContext() {} }
 
@@ -87,6 +90,11 @@ async function runPreStep(handler, { session, turn = 1, step = 2, messages = [] 
 /** One ordinary user message standing in for the step's fresh input. */
 function userMessage() {
   return createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } })
+}
+
+/** Persist an injected reminder the way the loop does (durable user message). */
+function persistReminder(session, message) {
+  session.append('user/message', message, { surfaceOp: 'append' })
 }
 
 test('parseRemindThreshold：缺省/数值/非法/关闭', () => {
@@ -164,7 +172,6 @@ test('finishedTodoSet / toolCallsSinceLastCompress：基于表面扫描', async 
   const session = buildRemindSession()
   appendTodoWrite(session, { callId: 'call-todo-1', text: 'Updated todo list: 0 pending, 0 in progress, 2 completed.' })
   appendToolCall(session, { callId: 'call-read-1' })
-  const { surfaceEntries } = await import('../lib/anchor/anchors.js')
   const entries = surfaceEntries(session)
   assert.ok(finishedTodoSet(entries, session.snapshotEvents()) !== null)
   assert.equal(toolCallsSinceLastCompress(entries), 2) // todo_write + read
@@ -303,4 +310,62 @@ test('优先级：token 压力优先于 unit 边界', async () => {
   const reminder = decision.messages.at(-1)
   assert.ok(reminder.content[0].text.startsWith('[dcp:context]'))
   assert.equal(reminder.source.trigger, undefined)
+})
+
+test('tokenBracket：按窗口（或绝对预算）的 10% 分档', () => {
+  assert.equal(tokenBracket(500, 500, 1000), 5)
+  assert.equal(tokenBracket(999, 500, 1000), 9)
+  assert.equal(tokenBracket(1000, 500, 1000), 10)
+  // 无窗口：以绝对预算为基准
+  assert.equal(tokenBracket(1000, 1000, undefined), 10)
+})
+
+test('lastTokenReminder：读取最近 token 提醒；unit/budget 提醒不算，后续压缩会重置', () => {
+  const session = buildRemindSession()
+  persistReminder(session, buildReminderMessage({ tokens: 900, window: 1000, anchors: ['a1'] }))
+  assert.equal(lastTokenReminder(surfaceEntries(session)).tokens, 900)
+  // unit 提醒不参与档位
+  persistReminder(session, buildReminderMessage({ anchors: ['a1'], trigger: 'unit' }))
+  assert.equal(lastTokenReminder(surfaceEntries(session)).tokens, 900)
+  // 其后发生压缩 → 重置
+  appendToolCall(session, { callId: 'call-compress-1', name: 'compress' })
+  assert.equal(lastTokenReminder(surfaceEntries(session)), undefined)
+})
+
+test('token 档位：同一 10% 档跨 turn 不重复提醒，跨档后再次提醒', async () => {
+  const session = buildRemindSession({ contextWindow: 1000 })
+  const meter = { tokens: 900, measure() { return { totalTokens: meter.tokens } } }
+  const { ctx, listeners } = fakeCtx(meter)
+  registerReminder(ctx, { threshold: 0.5, toolCallBudget: 0, logger: silentLogger })
+  const first = await runPreStep(listeners[0].handler, { session, turn: 2, messages: [userMessage()] })
+  assert.equal(first.messages.length, 2)
+  persistReminder(session, first.messages[1])
+
+  const same = await runPreStep(listeners[0].handler, { session, turn: 3, messages: [userMessage()] })
+  assert.equal(same.messages.length, 1)
+
+  meter.tokens = 1000
+  const higher = await runPreStep(listeners[0].handler, { session, turn: 4, messages: [userMessage()] })
+  assert.equal(higher.messages.length, 2)
+  assert.ok(higher.messages[1].content[0].text.startsWith('[dcp:context]'))
+})
+
+test('token 档位：压缩后或估算回落时重置', async () => {
+  const session = buildRemindSession({ contextWindow: 1000 })
+  const meter = { tokens: 900, measure() { return { totalTokens: meter.tokens } } }
+  const { ctx, listeners } = fakeCtx(meter)
+  registerReminder(ctx, { threshold: 0.5, toolCallBudget: 0, logger: silentLogger })
+  const first = await runPreStep(listeners[0].handler, { session, turn: 2, messages: [userMessage()] })
+  persistReminder(session, first.messages[1])
+
+  // 提醒之后的 compress 调用 → 档位重置
+  appendToolCall(session, { callId: 'call-compress-1', name: 'compress' })
+  const afterCompress = await runPreStep(listeners[0].handler, { session, turn: 3, messages: [userMessage()] })
+  assert.equal(afterCompress.messages.length, 2)
+  persistReminder(session, afterCompress.messages[1])
+
+  // 估算低于上次提醒 → 视为回落，重置
+  meter.tokens = 800
+  const afterDrop = await runPreStep(listeners[0].handler, { session, turn: 4, messages: [userMessage()] })
+  assert.equal(afterDrop.messages.length, 2)
 })

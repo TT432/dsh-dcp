@@ -87,8 +87,10 @@ prompt · work1 · [Compressed: a1 → here] summary · compress(a1, summary) ·
 | `DCP_DEBUG` | 非空且非 `0/false/off/no` 时，写 `$DSH_HOME/logs/dcp/dcp.log` 与 `context-<session>.jsonl`。 |
 
 提醒在 `agent/pre-step` 注入，三类按优先级 `[dcp:context]` > `[dcp:unit]` > `[dcp:budget]`，
-**每个 turn 至多一条**。与 omp 不同，dsh 的提醒是普通 `user/message` 事件，会持久化，
-因此用 turn 级节流替代 omp 的「每请求一条 + 10% 档位」。
+**每个 turn 至多一条**；`[dcp:context]` 还按上下文每增长 10% 才提醒一次——档位从最近一条
+token 提醒的估算值推导，其后的压缩或估算回落会重置档位（不新增持久状态）。
+与 omp 不同，dsh 的提醒是普通 `user/message` 事件，会持久化，因此用 turn 级节流 +
+档位共同限制重复（omp 的提醒不落盘，靠每请求 + 档位）。
 
 - `[dcp:context]`：估算上下文达到阈值。
 - `[dcp:unit]`：最新的 `todo_write` 结果报告列表完成
@@ -136,7 +138,8 @@ node --test test/compress-tests.mjs test/tool-tests.mjs test/anchor-tests.mjs te
 
 覆盖：LLM-DCP 既有回归、锚点扫描与唯一性、`session_start`、区间替换、链式累积、
 吸收、空区间/未知/已消耗锚点、system-prompt 更新保护、影子计价、摘要槽位与结构校验、
-严格层、基线继承、三类提醒的触发/优先级/节流、工具注册与参数校验。当前共 **71 项测试**。
+严格层、基线继承、三类提醒的触发/优先级/节流、token 提醒的 10% 档位、工具注册与参数校验。
+当前共 **75 项测试**。
 
 实机验证（desktop profile，子代理独立会话）：模型依次调用 `add_anchor`、`read`、
 `compress`，会话日志确认：
@@ -172,7 +175,8 @@ lib/tools/compress.js    既有 dcp_compress 工具
 与 omp 的刻意差异（完整清单见规格文档）：压缩是持久的 append-only 表面替换；
 不注入 `session_start` 标记消息；提醒会持久化且每 turn 至多一次；缺省提醒阈值为 `0.4`；
 in-history system-prompt 更新不可被压缩区间遮蔽；工具调用预算按表面最近一次
-`compress` 调用计数（dsh 禁止 `run_code` 子调用压缩，因此无需 omp 的持久水位）。
+`compress` 调用计数（dsh 禁止 `run_code` 子调用压缩，因此无需 omp 的持久水位）；
+token 提醒的 10% 档位从日志推导而不写持久状态。
 
 ## 参考
 
