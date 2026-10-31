@@ -1,19 +1,32 @@
-// Over-threshold reminder tests: threshold parsing, budget resolution,
-// estimation fallback, and the agent/pre-step waterfall behavior.
+// Reminder tests: threshold parsing, budget resolution, estimation fallback,
+// and the agent/pre-step waterfall behavior for the three triggers
+// (token pressure, work-unit boundary, tool-call budget).
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import {
   DEFAULT_REMIND_THRESHOLD,
+  DEFAULT_TOOLCALL_BUDGET,
   buildReminderMessage,
   estimateContextTokens,
+  finishedTodoSet,
   heuristicContextTokens,
+  parseRemindPolicy,
   parseRemindThreshold,
+  parseToolcallBudget,
   registerReminder,
   remindBudget,
   resolveContextWindow,
+  toolCallsSinceLastCompress,
 } from '../lib/anchor/remind.js'
-import { appendRequestContext, appendSystem, appendPrompt, createSession } from './helpers.mjs'
+import {
+  appendAssistant,
+  appendPrompt,
+  appendRequestContext,
+  appendSystem,
+  appendToolResult,
+  createSession,
+} from './helpers.mjs'
 
 const silentLogger = { info() {}, debug() {}, warn() {}, error() {}, saveContext() {} }
 
@@ -30,6 +43,26 @@ function buildRemindSession({ contextWindow = 1000, work = 'some work text' } = 
   return session
 }
 
+/** Append a `todo_write` call plus its rendered result. */
+function appendTodoWrite(session, { callId, text, turn = 1, step = 1 }) {
+  const assistant = appendAssistant(session, {
+    turn,
+    step,
+    calls: [{ callId, name: 'todo_write', args: { todos: [] } }],
+  })
+  appendToolResult(session, { turn, step, callId, callSeq: assistant.callSeqs.get(callId), text })
+}
+
+/** Append a generic tool call plus its result. */
+function appendToolCall(session, { callId, name = 'read', text = 'ok', turn = 1, step = 1 }) {
+  const assistant = appendAssistant(session, {
+    turn,
+    step,
+    calls: [{ callId, name, args: {} }],
+  })
+  appendToolResult(session, { turn, step, callId, callSeq: assistant.callSeqs.get(callId), text })
+}
+
 /** Fake plugin context capturing `on` registrations and serving tokenMeter. */
 function fakeCtx(tokenMeter) {
   const listeners = []
@@ -43,12 +76,17 @@ function fakeCtx(tokenMeter) {
 }
 
 /** Invoke a registered pre-step handler with the given defaults. */
-async function runPreStep(handler, { session, turn = 1, step = 1, messages = [] }) {
+async function runPreStep(handler, { session, turn = 1, step = 2, messages = [] }) {
   const controller = new AbortController()
   return handler(
     { agent: { session }, turn, step, signal: controller.signal },
     async () => ({ kind: 'enter', messages }),
   )
+}
+
+/** One ordinary user message standing in for the step's fresh input. */
+function userMessage() {
+  return createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } })
 }
 
 test('parseRemindThreshold：缺省/数值/非法/关闭', () => {
@@ -60,6 +98,19 @@ test('parseRemindThreshold：缺省/数值/非法/关闭', () => {
   assert.equal(parseRemindThreshold('200000'), 200000)
   assert.equal(parseRemindThreshold('0'), 0)
   assert.equal(parseRemindThreshold('-1'), -1)
+})
+
+test('parseToolcallBudget / parseRemindPolicy：缺省 40，非法回落，关闭', () => {
+  assert.equal(DEFAULT_TOOLCALL_BUDGET, 40)
+  assert.equal(parseToolcallBudget(undefined), 40)
+  assert.equal(parseToolcallBudget('abc'), 40)
+  assert.equal(parseToolcallBudget('12'), 12)
+  assert.equal(parseToolcallBudget('0'), 0)
+  assert.deepEqual(parseRemindPolicy({}), { threshold: 0.4, toolCallBudget: 40 })
+  assert.deepEqual(
+    parseRemindPolicy({ DCP_REMIND_THRESHOLD: '0.5', DCP_REMIND_TOOLCALLS: '10' }),
+    { threshold: 0.5, toolCallBudget: 10 },
+  )
 })
 
 test('remindBudget：比例/绝对值/关闭/未知窗口', () => {
@@ -85,57 +136,73 @@ test('estimateContextTokens：tokenMeter 优先，缺失时用启发式', () => 
   assert.equal(estimateContextTokens(session, { measure: () => { throw new Error('boom') } }), fallback)
 })
 
-test('buildReminderMessage：列出锚点、注入 source kind', () => {
-  const session = buildRemindSession()
-  const message = buildReminderMessage({ tokens: 900, window: 1000, anchors: ['session_start', 'a1'] })
+test('buildReminderMessage：token 提醒列出锚点、注入 source kind', () => {
+  const message = buildReminderMessage({ tokens: 900, window: 1000, anchors: ['a1'] })
   assert.equal(message.role, 'user')
   assert.equal(message.source.kind, 'dcp-reminder')
   assert.equal(message.source.tokens, 900)
   assert.equal(message.source.contextWindow, 1000)
   const text = message.content[0].text
   assert.ok(text.startsWith('[dcp:context] Context is at ~900 tokens'))
-  assert.ok(text.includes('"session_start", "a1"'))
+  assert.ok(text.includes('"a1"'))
   assert.ok(text.includes('call compress with startAnchor'))
+  assert.ok(text.includes('session_start'))
 })
 
-test('registerReminder：阈值 <= 0 时不注册监听', () => {
+test('buildReminderMessage：unit / budget 提醒各带自己的标记与 source', () => {
+  const unit = buildReminderMessage({ anchors: ['a1'], trigger: 'unit' })
+  assert.ok(unit.content[0].text.startsWith('[dcp:unit]'))
+  assert.equal(unit.source.trigger, 'unit')
+  const budget = buildReminderMessage({ anchors: ['a1'], trigger: 'budget', used: 42, budget: 40 })
+  assert.ok(budget.content[0].text.startsWith('[dcp:budget] 42 tool calls'))
+  assert.equal(budget.source.trigger, 'budget')
+  assert.equal(budget.source.used, 42)
+  assert.equal(budget.source.budget, 40)
+})
+
+test('finishedTodoSet / toolCallsSinceLastCompress：基于表面扫描', async () => {
+  const session = buildRemindSession()
+  appendTodoWrite(session, { callId: 'call-todo-1', text: 'Updated todo list: 0 pending, 0 in progress, 2 completed.' })
+  appendToolCall(session, { callId: 'call-read-1' })
+  const { surfaceEntries } = await import('../lib/anchor/anchors.js')
+  const entries = surfaceEntries(session)
+  assert.ok(finishedTodoSet(entries, session.snapshotEvents()) !== null)
+  assert.equal(toolCallsSinceLastCompress(entries), 2) // todo_write + read
+})
+
+test('registerReminder：token 与 toolcall 都关闭时仍注册（unit 触发保留）', () => {
   const { ctx, listeners } = fakeCtx(undefined)
-  registerReminder(ctx, { threshold: 0, logger: silentLogger })
-  assert.equal(listeners.length, 0)
+  registerReminder(ctx, { threshold: 0, toolCallBudget: 0, logger: silentLogger })
+  assert.deepEqual(listeners.map((entry) => entry.name), ['agent/pre-step', 'agent/turn-stopping'])
 })
 
 test('registerReminder：超预算注入提醒，同 turn 只一次，下个 turn 再提醒', async () => {
   const session = buildRemindSession({ contextWindow: 1000 })
   const { ctx, listeners } = fakeCtx({ measure: () => ({ totalTokens: 900 }) })
-  registerReminder(ctx, { threshold: 0.5, logger: silentLogger })
-  assert.equal(listeners.length, 2)
-  assert.equal(listeners[0].name, 'agent/pre-step')
-  assert.equal(listeners[1].name, 'agent/turn-stopping')
+  registerReminder(ctx, { threshold: 0.5, toolCallBudget: 0, logger: silentLogger })
 
-  const userMessage = createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } })
-  const first = await runPreStep(listeners[0].handler, { session, turn: 1, messages: [userMessage] })
+  const first = await runPreStep(listeners[0].handler, { session, turn: 1, messages: [userMessage()] })
   assert.equal(first.messages.length, 2)
   assert.equal(first.messages[1].source.kind, 'dcp-reminder')
 
-  const second = await runPreStep(listeners[0].handler, { session, turn: 1, messages: [userMessage] })
+  const second = await runPreStep(listeners[0].handler, { session, turn: 1, messages: [userMessage()] })
   assert.equal(second.messages.length, 1)
 
-  const nextTurn = await runPreStep(listeners[0].handler, { session, turn: 2, messages: [userMessage] })
+  const nextTurn = await runPreStep(listeners[0].handler, { session, turn: 2, messages: [userMessage()] })
   assert.equal(nextTurn.messages.length, 2)
 })
 
 test('registerReminder：未超预算/未知窗口/reject 决策都不注入', async () => {
   const session = buildRemindSession({ contextWindow: 1000 })
   const { ctx, listeners } = fakeCtx({ measure: () => ({ totalTokens: 100 }) })
-  registerReminder(ctx, { threshold: 0.5, logger: silentLogger })
-  const userMessage = createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } })
-  const under = await runPreStep(listeners[0].handler, { session, messages: [userMessage] })
+  registerReminder(ctx, { threshold: 0.5, toolCallBudget: 0, logger: silentLogger })
+  const under = await runPreStep(listeners[0].handler, { session, messages: [userMessage()] })
   assert.equal(under.messages.length, 1)
 
   const windowless = createSession('windowless-2')
   appendSystem(windowless)
   appendPrompt(windowless)
-  const noWindow = await runPreStep(listeners[0].handler, { session: windowless, messages: [userMessage] })
+  const noWindow = await runPreStep(listeners[0].handler, { session: windowless, messages: [userMessage()] })
   assert.equal(noWindow.messages.length, 1)
 
   const rejected = await listeners[0].handler(
@@ -148,7 +215,7 @@ test('registerReminder：未超预算/未知窗口/reject 决策都不注入', a
 test('registerReminder：step 1 无消息不复活已完成的 turn', async () => {
   const session = buildRemindSession({ contextWindow: 1000 })
   const { ctx, listeners } = fakeCtx({ measure: () => ({ totalTokens: 900 }) })
-  registerReminder(ctx, { threshold: 0.5, logger: silentLogger })
+  registerReminder(ctx, { threshold: 0.5, toolCallBudget: 0, logger: silentLogger })
   const decision = await runPreStep(listeners[0].handler, { session, turn: 1, step: 1, messages: [] })
   assert.equal(decision.messages.length, 0)
 })
@@ -156,7 +223,7 @@ test('registerReminder：step 1 无消息不复活已完成的 turn', async () =
 test('registerReminder：本 step 新消息计入阈值，避免晚一拍', async () => {
   const session = buildRemindSession({ contextWindow: 1000 })
   const { ctx, listeners } = fakeCtx({ measure: () => ({ totalTokens: 90 }) })
-  registerReminder(ctx, { threshold: 0.1, logger: silentLogger })
+  registerReminder(ctx, { threshold: 0.1, toolCallBudget: 0, logger: silentLogger })
   const bigMessage = createUserMessage({
     content: [{ type: 'text', text: 'x'.repeat(400) }],
     source: { kind: 'user' },
@@ -169,15 +236,71 @@ test('registerReminder：本 step 新消息计入阈值，避免晚一拍', asyn
 test('registerReminder：turn-stopping 后空消息不复活 turn，标记只消费一次', async () => {
   const session = buildRemindSession({ contextWindow: 1000 })
   const { ctx, listeners } = fakeCtx({ measure: () => ({ totalTokens: 900 }) })
-  registerReminder(ctx, { threshold: 0.5, logger: silentLogger })
+  registerReminder(ctx, { threshold: 0.5, toolCallBudget: 0, logger: silentLogger })
   const stopping = listeners.find((entry) => entry.name === 'agent/turn-stopping').handler
   stopping({ agent: { session }, turn: 7, signal: new AbortController().signal })
 
-  const closing = await runPreStep(listeners[0].handler, { session, turn: 7, step: 2, messages: [] })
+  const closing = await runPreStep(listeners[0].handler, { session, turn: 7, messages: [] })
   assert.equal(closing.messages.length, 0)
 
   // 标记已消费：若之后确有继续执行的 step，不应对其永久屏蔽提醒。
-  const continued = await runPreStep(listeners[0].handler, { session, turn: 7, step: 3, messages: [] })
+  const continued = await runPreStep(listeners[0].handler, { session, turn: 7, messages: [] })
   assert.equal(continued.messages.length, 1)
-  assert.equal(continued.messages[0].source.kind, 'dcp-reminder')
+})
+
+test('unit 提醒：todo 全部完成时注入（token 未超）', async () => {
+  const session = buildRemindSession({ contextWindow: 1000 })
+  appendTodoWrite(session, { callId: 'call-todo-1', text: 'Updated todo list: 0 pending, 0 in progress, 2 completed.' })
+  const { ctx, listeners } = fakeCtx({ measure: () => ({ totalTokens: 100 }) })
+  registerReminder(ctx, { threshold: 0.5, toolCallBudget: 0, logger: silentLogger })
+  const decision = await runPreStep(listeners[0].handler, { session, turn: 2, messages: [userMessage()] })
+  const reminder = decision.messages.at(-1)
+  assert.equal(reminder.source.trigger, 'unit')
+  assert.ok(reminder.content[0].text.startsWith('[dcp:unit]'))
+  assert.ok(reminder.content[0].text.includes('work-unit boundary'))
+})
+
+test('unit 提醒：最新 todo 仍未完成则不注入', async () => {
+  const session = buildRemindSession({ contextWindow: 1000 })
+  appendTodoWrite(session, { callId: 'call-todo-1', text: 'Updated todo list: 1 pending, 0 in progress, 1 completed.' })
+  const { ctx, listeners } = fakeCtx({ measure: () => ({ totalTokens: 100 }) })
+  registerReminder(ctx, { threshold: 0.5, toolCallBudget: 0, logger: silentLogger })
+  const decision = await runPreStep(listeners[0].handler, { session, turn: 2, messages: [userMessage()] })
+  assert.equal(decision.messages.length, 1)
+})
+
+test('budget 提醒：自上次压缩以来的工具调用达到预算时注入', async () => {
+  const session = buildRemindSession({ contextWindow: 1000 })
+  appendToolCall(session, { callId: 'call-read-1' })
+  appendToolCall(session, { callId: 'call-read-2' })
+  appendToolCall(session, { callId: 'call-read-3' })
+  const { ctx, listeners } = fakeCtx({ measure: () => ({ totalTokens: 100 }) })
+  registerReminder(ctx, { threshold: 0.5, toolCallBudget: 2, logger: silentLogger })
+  const decision = await runPreStep(listeners[0].handler, { session, turn: 2, messages: [userMessage()] })
+  const reminder = decision.messages.at(-1)
+  assert.equal(reminder.source.trigger, 'budget')
+  assert.equal(reminder.source.used, 3)
+  assert.equal(reminder.source.budget, 2)
+  assert.ok(reminder.content[0].text.startsWith('[dcp:budget] 3 tool calls'))
+})
+
+test('budget 提醒：compress 之后重新计数', async () => {
+  const session = buildRemindSession({ contextWindow: 1000 })
+  appendToolCall(session, { callId: 'call-compress-1', name: 'compress' })
+  appendToolCall(session, { callId: 'call-read-1' })
+  const { ctx, listeners } = fakeCtx({ measure: () => ({ totalTokens: 100 }) })
+  registerReminder(ctx, { threshold: 0.5, toolCallBudget: 2, logger: silentLogger })
+  const decision = await runPreStep(listeners[0].handler, { session, turn: 2, messages: [userMessage()] })
+  assert.equal(decision.messages.length, 1)
+})
+
+test('优先级：token 压力优先于 unit 边界', async () => {
+  const session = buildRemindSession({ contextWindow: 1000 })
+  appendTodoWrite(session, { callId: 'call-todo-1', text: 'Updated todo list: 0 pending, 0 in progress, 1 completed.' })
+  const { ctx, listeners } = fakeCtx({ measure: () => ({ totalTokens: 900 }) })
+  registerReminder(ctx, { threshold: 0.5, toolCallBudget: 0, logger: silentLogger })
+  const decision = await runPreStep(listeners[0].handler, { session, turn: 2, messages: [userMessage()] })
+  const reminder = decision.messages.at(-1)
+  assert.ok(reminder.content[0].text.startsWith('[dcp:context]'))
+  assert.equal(reminder.source.trigger, undefined)
 })

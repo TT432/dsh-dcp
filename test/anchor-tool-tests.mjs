@@ -10,6 +10,8 @@ import {
   buildAnchorScenario,
   createSession,
   derivedShape,
+  fullSummary,
+  slotSummary,
   tokenMeter,
 } from './helpers.mjs'
 
@@ -88,8 +90,9 @@ test('compress：执行压缩并渲染结果', async () => {
   const { ctx, tools } = fakeCtx()
   registerAnchorTools(ctx, { logger: silentLogger })
   const { session, compressCallId } = buildAnchorScenario()
+  const summary = slotSummary({ '已完成': '- 完成工具接线 证据: lib/tools/anchor.js:1' })
   const value = await tools[1].execute(
-    { startAnchor: 'a1', summary: 'WORK DONE' },
+    { startAnchor: 'a1', summary },
     { callId: compressCallId, agent: { session }, signal: new AbortController().signal },
   )
   assert.equal(value.anchor, 'a1')
@@ -111,7 +114,7 @@ test('compress：session_start 缺 force 的报错透传给模型', async () => 
   const { session, compressCallId } = buildAnchorScenario()
   await assert.rejects(
     tools[1].execute(
-      { startAnchor: 'session_start', summary: 'ALL' },
+      { startAnchor: 'session_start', summary: fullSummary() },
       { callId: compressCallId, agent: { session }, signal: new AbortController().signal },
     ),
     /force=true/,

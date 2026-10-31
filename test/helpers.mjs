@@ -15,6 +15,44 @@ import { estimateMessage } from '@deepseek-ai/dsh-token-meter/estimate'
 /** Fake service face matching ctx.tokenMeter for pricing. */
 export const tokenMeter = { estimateMessage }
 
+/** Slot headers of the fixed summary schema, in order. */
+export const SUMMARY_SLOTS = ['当前任务', '已完成', '未完成', '约束', '文件与命令', '在跑作业与句柄']
+
+/**
+ * Build a schema-valid slot summary. Every slot defaults to `- 无` except
+ * 当前任务 (mandatory); override individual slot bodies to exercise inheritance
+ * or the strict tier.
+ * @param {Record<string, string>} [overrides] - slot name → bullet block.
+ * @returns {string} summary text.
+ */
+export function slotSummary(overrides = {}) {
+  const defaults = {
+    '当前任务': '- 测试上下文压缩 证据: test/helpers.mjs:1',
+    '已完成': '- 无',
+    '未完成': '- 无',
+    '约束': '- 无',
+    '文件与命令': '- 无',
+    '在跑作业与句柄': '- 无',
+  }
+  const merged = { ...defaults, ...overrides }
+  return SUMMARY_SLOTS.map((slot) => `## ${slot}\n${merged[slot]}`).join('\n')
+}
+
+/**
+ * A strict-tier (session_start) summary: 已完成 / 未完成 carry real content and
+ * every evidence pointer is a locator.
+ * @param {Record<string, string>} [overrides] - slot name → bullet block.
+ * @returns {string} summary text.
+ */
+export function fullSummary(overrides = {}) {
+  return slotSummary({
+    '已完成': '- 完成压缩核心 证据: lib/anchor/compress.js:1',
+    '未完成': '- 运行测试 证据: test/remind-tests.mjs:1',
+    ...overrides,
+  })
+}
+
+
 /** Create a detached session for tests. */
 export function createSession(id = 'dcp-test-session') {
   return Session.create(id)
@@ -118,7 +156,7 @@ export function buildAnchorScenario({
   const compressStep = appendAssistant(session, {
     turn: 3,
     step: 1,
-    calls: [{ callId: compressCallId, name: 'compress', args: { startAnchor: anchorName, summary: 'summary' } }],
+    calls: [{ callId: compressCallId, name: 'compress', args: { startAnchor: anchorName, summary: slotSummary() } }],
   })
 
   return { session, anchorCallId, compressCallId, compressEntrySeq: compressStep.seq }
