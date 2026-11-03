@@ -87,6 +87,9 @@ prompt · work1 · [Compressed: a1 → here] (block 1) summary · compress(a1, s
 块已经不在当前表面上（被后来压缩吸收）也仍然可取回，因为原始事件保留在日志里。
 未知块号报错并列出已知块号。
 
+注意：`expand` 只还原**压缩块（模型写的摘要）**，不还原被压缩区间内的原始消息或
+工具返回——那些原始事件仍在会话日志里，但不会重新进入派生给模型的上下文。
+
 ### `dcp_compress`
 
 既有 LLM-DCP 工具：多步迭代压缩 prompt/文档/会话文本，支持 `targetRatio`、`steps`、
@@ -145,10 +148,11 @@ dsh plugin --profile desktop add -w <path/to/dcp-plugin>
 #       name: 'dsh-dcp'
 ```
 
-新装依赖或修改插件源码后**需要重启对应应用**。修改 `cordis.patch.yml` 会热加载，但
-`link:` 源码本身的变更**不保证热更新**：2026-11-03 本机 web 进程在源码改为 0.4.0 后，
-新建子代理会话仍执行旧版工具（旧版确认文本、压缩节点无 `blockId`、`compress(session_start)`
-报旧版 force/严格档错误）。
+新装依赖或修改插件源码后，若需要在不重启应用的情况下生效，可**改变**
+`cordis.patch.yml` 的内容（例如增删一行注释）：HMR 会重新组合 profile，并把已变化的
+`link:` 包目标一起替换。2026-11-03 实测：只 `touch`（仅改 mtime）不会触发；内容变化后
+当前 web 进程成功从旧版工具表切换到 0.4（新提醒文本、`expand` 工具、带 `blockId` 的
+压缩节点均生效）。`dsh plugin add` 新装 npm 依赖仍需要重启 web 服务才能被 Loader 解析。
 
 ## 测试
 
@@ -166,26 +170,30 @@ node --test test/compress-tests.mjs test/tool-tests.mjs test/blocks-tests.mjs \
 
 本版本的单元/集成测试在真实 dsh Session（0.2.1-rc.3）上运行，覆盖上述全部逻辑，共 **83 项全绿**。
 
-**实机 e2e（链式吸收 / expand）尚未在本机运行进程重跑**：2026-11-03 在 web 进程里派生子代理会话
-执行 `add_anchor → compress(a1) → compress(session_start) → expand(block 1)` 时，运行中的插件
-仍是旧版（`add_anchor` 返回旧文本、压缩节点无 `(block N)` / `blockId`、`compress(session_start)`
-报旧版 force/严格档错误），说明已链接源码没有热更新（见「安装」）。该次 e2e 只证明旧版行为，
-**不能作为本版本的实机证据**；重启应用后应按同一序列复测。
-
-历史实机记录（链式摘要之前的版本，保持原文）：模型依次调用 `add_anchor`、`read`、
-`compress`，会话日志确认：
+**实机 e2e（链式吸收 / expand，2026-11-03，desktop profile，HMR 重载后的 web 进程，
+子代理独立会话）**：模型依次执行
+`write note.txt → add_anchor e2e-a1 → read → compress(e2e-a1) → add_anchor e2e-a2 →
+write note.txt → compress(session_start) → expand(block 1)`，真实 dsh 0.2.1-rc.3 会话日志确认：
 
 ```text
-seq 28  compaction/prune   shadowedRange 18–22, shadowedTokenCount 2268
-seq 29  user/message       replace 18–22, [Compressed: e2e-anchor → here] ...
-seq 30  tool/result        compress 确认：3 message(s) elided，并报告净释放 token 估算
+#28  tool-call        add_anchor e2e-a1
+#42  compaction/prune shadowedSeqs [28,30,34,36], shadowedTokenCount 166
+#43  dcp-compress     block=1 parents=[] anchor=e2e-a1
+                      [Compressed: e2e-a1 → here] (block 1) …
+#44  tool/result      as block 1；4 message(s) elided, ~43 tokens freed
+#63  compaction/prune shadowedSeqs [13 nodes], shadowedTokenCount 4331
+#64  dcp-compress     block=2 parents=[1] anchor=session_start
+                      …已并入本块的旧压缩块（索引，全文未丢失）:
+                      - 块 1「e2e-a1」：验证 dcp 锚点压缩 — 全文: expand({block: 1})
+#65  tool/result      as block 2. Absorbed 1 prior block(s)；13 message(s) elided, ~4187 tokens freed
+#75  tool/result      expand："[block 1「e2e-a1」 — 全文]" + 块 1 摘要全文
+#77  tool/result      read note.txt → alpha / beta
 ```
 
 返回的 `freedTokens` 按 `shadowedTokenCount − 摘要节点估算 token` 计算（下限为 0），
 不是把被遮蔽区间的总量误报为净释放量。原始 add_anchor/read 事件仍在日志中；派生上下文只保留
-摘要、compress 调用与确认结果。同一子会话随后执行第二次压缩（`e2e-final-2`）时，首个
-`[Compressed: e2e-final → here]` 摘要仍保留，返回 `4 message(s) elided, ~628 tokens freed`。
-该记录来自旧版本，不包含链式索引与 `expand`。
+摘要、compress 调用与确认结果。第二次压缩跨过第一次压缩时，新块的索引行列出旧块号并可用
+`expand({block: 1})` 取回旧摘要全文——链式吸收与全文取回均已在实机验证。
 
 ## 实现结构
 

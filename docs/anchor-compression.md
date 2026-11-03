@@ -222,6 +222,8 @@ dsh 的官方等价机制是 **surface replacement**（compaction 用的同一�
   ```
 
   没有更深一层时省略索引段。
+- `expand` 只返回**压缩块（模型写的摘要）**；被压缩区间内的原始消息/工具返回不会
+  因此恢复——它们仍在会话日志里，但不进入派生给模型的上下文。
 - `expand` 不改变任何状态；可在同一 turn 内多次调用。
 
 ### FR-6 压缩提醒（两类，对齐 omp `5954be4` / `3caea33` / `4d7c8ce` / `c83eeaa` / `99a4f87`）
@@ -376,6 +378,11 @@ lossy call available: ...
   出现在工具表；子代理会话中模型调用 `compress` 后，日志中 `compaction/prune`
   与替换事件相邻、`deriveMessages()` 只含摘要节点与 compress 调用/结果；
   跨过旧块再次压缩后，新摘要下出现旧块索引行，`expand` 能取回旧摘要全文。
-- 本版本的实机复测需**重启对应应用**：已链接源码的变更不保证热更新
-  （2026-11-03 本机 web 进程在源码改为 0.4.0 后仍执行旧版工具）。单元/集成测试
-  在真实 dsh Session 上覆盖链式与 `expand`；实机重跑前不得宣称已端到端验证。
+- 2026-11-03 实机 e2e（desktop profile，HMR 重载后，子代理独立会话）：
+  `add_anchor e2e-a1 → compress(e2e-a1)` 得 block 1；`compress(session_start)`
+  吸收 block 1 得 block 2，摘要下出现 `块 1「e2e-a1」… expand({block: 1})` 索引行；
+  `expand({block:1})` 返回块 1 摘要全文。会话日志中 `compaction/prune` 与替换事件
+  相邻，`deriveMessages()` 只含摘要节点与 compress 调用/结果。
+- 热重载：只 `touch` 补丁（仅改 mtime）不触发；**改变** `cordis.patch.yml` 内容
+  会触发 HMR 的 profile recomposition，并把已变化的 `link:` 包目标一起替换
+  （2026-11-03 实测，旧版工具表切换到 0.4）。
