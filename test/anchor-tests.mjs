@@ -1,4 +1,7 @@
 // Anchor model + compression core tests against a real detached dsh Session.
+//
+// The chain semantics come from omp 99a4f87: absorbed blocks are not validated
+// away, they stay in the log and become index lines under the new summary.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
@@ -9,6 +12,7 @@ import {
   validateAnchorName,
 } from '../lib/anchor/anchors.js'
 import { compressFromAnchor, recordAnchor } from '../lib/anchor/compress.js'
+import { expandBlock, scanCompressionBlocks } from '../lib/anchor/blocks.js'
 import { estimateMessage } from '@deepseek-ai/dsh-token-meter/estimate'
 import { createSystemMessage, createUserMessage } from '@deepseek-ai/dsh-llm'
 import {
@@ -18,7 +22,6 @@ import {
   createSession,
   derivedShape,
   entriesOf,
-  fullSummary,
   slotSummary,
   tokenMeter,
   appendSystem,
@@ -49,6 +52,23 @@ function buildSplitScenario() {
   return { session, compressCallId: 'call-compress-1' }
 }
 
+/** Append a second anchor + work + a compress call, returning its id. */
+function appendSecondCompression(session, { anchorName = 'a2', anchorCallId = 'call-anchor-2', compressCallId = 'call-compress-2' } = {}) {
+  const anchorStep = appendAssistant(session, {
+    turn: 10,
+    step: 1,
+    calls: [{ callId: anchorCallId, name: 'add_anchor', args: { anchor: anchorName } }],
+  })
+  appendToolResult(session, { turn: 10, step: 1, callId: anchorCallId, callSeq: anchorStep.callSeqs.get(anchorCallId) })
+  appendAssistant(session, { turn: 11, step: 1, text: 'SECOND WORK' })
+  appendAssistant(session, {
+    turn: 12,
+    step: 1,
+    calls: [{ callId: compressCallId, name: 'compress', args: {} }],
+  })
+  return compressCallId
+}
+
 test('scanLiveAnchors：session_start + 真实锚点，消耗后消失', () => {
   const { session, compressCallId } = buildAnchorScenario()
   assert.deepEqual(scanLiveAnchors(entriesOf(session)).map((a) => a.name), ['session_start', 'a1'])
@@ -71,8 +91,7 @@ test('firstUserEntryIndex：优先 source.kind=user，session_start 保留真正
     source: { kind: 'runtime-context' },
   }), { surfaceOp: 'append' })
   appendPrompt(session, 'REAL PROMPT')
-  const entriesBefore = entriesOf(session)
-  assert.equal(firstUserEntryIndex(entriesBefore), 2)
+  assert.equal(firstUserEntryIndex(entriesOf(session)), 2)
 
   const anchorStep = appendAssistant(session, {
     turn: 2,
@@ -86,13 +105,13 @@ test('firstUserEntryIndex：优先 source.kind=user，session_start 保留真正
     step: 1,
     calls: [{ callId: 'call-compress-1', name: 'compress', args: {} }],
   })
-  const summary = fullSummary()
+  const summary = slotSummary()
+  // omp 99a4f87 移除了 force：session_start 直接可用（旧块仍可 expand 取回）。
   const result = compressFromAnchor({
     session,
     tokenMeter,
     startAnchor: 'session_start',
     summary,
-    force: true,
     callId: 'call-compress-1',
     logger: silentLogger,
   })
@@ -101,7 +120,7 @@ test('firstUserEntryIndex：优先 source.kind=user，session_start 保留真正
   assert.deepEqual(shape.map((m) => m.role), ['system', 'user', 'user', 'user', 'assistant'])
   assert.equal(shape[1].text, 'INJECTED CONTEXT')
   assert.equal(shape[2].text, 'REAL PROMPT')
-  assert.equal(shape[3].text, `[Compressed: session_start → here]\n${summary}`)
+  assert.equal(shape[3].text, `[Compressed: session_start → here] (block 1)\n${summary}`)
 })
 
 test('validateAnchorName：空/空白/超长/保留名', () => {
@@ -156,15 +175,22 @@ test('compress：区间遮蔽 + 摘要节点 + compress 调用保留', () => {
     logger: silentLogger,
   })
   assert.equal(result.anchor, 'a1')
+  assert.equal(result.blockId, 1)
   assert.equal(result.shadowedMessages, 3) // anchor assistant + result + WORK
   assert.equal(result.absorbed, 0)
+  assert.deepEqual(result.chain, [])
+  assert.deepEqual(result.problems, [])
   assert.equal(session.seq, before + 2)
 
   const shape = derivedShape(session)
   assert.deepEqual(shape.map((m) => m.role), ['system', 'user', 'user', 'assistant'])
   assert.equal(shape[1].text, 'Original user prompt')
   assert.equal(shape[2].source, 'dcp-compress')
-  assert.equal(shape[2].text, `[Compressed: a1 → here]\n${summary}`)
+  assert.equal(shape[2].text, `[Compressed: a1 → here] (block 1)\n${summary}`)
+  const replacement = session.snapshotEvents()[before + 1]
+  assert.equal(replacement.data.source.blockId, 1)
+  assert.deepEqual(replacement.data.source.parentIds, [])
+  assert.equal(replacement.data.source.startToolCallId, 'call-anchor-1')
   const compressMessage = session.deriveMessages().at(-1)
   assert.equal(compressMessage.content[0].type, 'tool-call')
   assert.equal(compressMessage.content[0].id, compressCallId)
@@ -172,7 +198,6 @@ test('compress：区间遮蔽 + 摘要节点 + compress 调用保留', () => {
   // 影子计价事件紧邻替换事件
   const events = session.snapshotEvents()
   const prune = events[before]
-  const replacement = events[before + 1]
   assert.equal(prune.type, 'compaction/prune')
   assert.equal(replacement.type, 'user/message')
   assert.deepEqual(replacement.sourceEventSeqs, result.shadowedSeqs)
@@ -191,29 +216,21 @@ test('compress：区间遮蔽 + 摘要节点 + compress 调用保留', () => {
   assert.equal(result.freedTokens, Math.max(0, shadowedPrice - estimateMessage(replacement.data)))
 })
 
-test('compress：session_start 必须 force，且保留原始 prompt', () => {
+test('compress：session_start 不再需要 force，保留原始 prompt', () => {
   const { session, compressCallId } = buildSplitScenario()
-  const before = session.seq
-  assert.throws(
-    () => compressFromAnchor({ session, tokenMeter, startAnchor: 'session_start', summary: slotSummary(), callId: compressCallId, logger: silentLogger }),
-    /force=true/,
-  )
-  assert.equal(session.seq, before)
-
-  const summary = fullSummary()
+  const summary = slotSummary()
   const result = compressFromAnchor({
     session,
     tokenMeter,
     startAnchor: 'session_start',
     summary,
-    force: true,
     callId: compressCallId,
     logger: silentLogger,
   })
   assert.equal(result.shadowedMessages, 4) // EARLY WORK + anchor + result + LATE WORK
   assert.deepEqual(derivedShape(session).map((m) => m.role), ['system', 'user', 'user', 'assistant'])
   assert.equal(derivedShape(session)[1].text, 'Original user prompt')
-  assert.equal(derivedShape(session)[2].text, `[Compressed: session_start → here]\n${summary}`)
+  assert.equal(derivedShape(session)[2].text, `[Compressed: session_start → here] (block 1)\n${summary}`)
 })
 
 test('compress：真实锚点起点不吞掉起点之前的工作', () => {
@@ -223,49 +240,41 @@ test('compress：真实锚点起点不吞掉起点之前的工作', () => {
   const shape = derivedShape(session)
   assert.deepEqual(shape.map((m) => m.role), ['system', 'user', 'assistant', 'user', 'assistant'])
   assert.equal(shape[2].text, 'EARLY WORK')
-  assert.equal(shape[3].text, `[Compressed: a1 → here]\n${summary}`)
+  assert.equal(shape[3].text, `[Compressed: a1 → here] (block 1)\n${summary}`)
 })
 
-test('compress：链式压缩累积摘要', () => {
+test('compress：链式压缩累积摘要，两个块各自存活', () => {
   const { session } = buildAnchorScenario()
   const first = slotSummary()
-  const second = slotSummary()
+  const second = slotSummary({ '当前任务': '- 第二段工作 证据: a.md:2' })
   compressFromAnchor({ session, tokenMeter, startAnchor: 'a1', summary: first, callId: 'call-compress-1', logger: silentLogger })
-
-  const anchor2 = appendAssistant(session, {
-    turn: 4,
-    step: 1,
-    calls: [{ callId: 'call-anchor-2', name: 'add_anchor', args: { anchor: 'a2' } }],
-  })
-  appendToolResult(session, { turn: 4, step: 1, callId: 'call-anchor-2', callSeq: anchor2.callSeqs.get('call-anchor-2') })
-  appendAssistant(session, { turn: 5, step: 1, text: 'SECOND WORK' })
-  appendAssistant(session, {
-    turn: 6,
-    step: 1,
-    calls: [{ callId: 'call-compress-2', name: 'compress', args: {} }],
-  })
+  const compress2 = appendSecondCompression(session)
 
   const result = compressFromAnchor({
     session,
     tokenMeter,
     startAnchor: 'a2',
     summary: second,
-    callId: 'call-compress-2',
+    callId: compress2,
     logger: silentLogger,
   })
+  assert.equal(result.blockId, 2)
   assert.equal(result.absorbed, 0)
+  assert.deepEqual(result.chain, [])
   const summaries = derivedShape(session).filter((m) => m.source === 'dcp-compress')
   assert.deepEqual(summaries.map((m) => m.text), [
-    `[Compressed: a1 → here]\n${first}`,
-    `[Compressed: a2 → here]\n${second}`,
+    `[Compressed: a1 → here] (block 1)\n${first}`,
+    `[Compressed: a2 → here] (block 2)\n${second}`,
   ])
 })
 
-test('compress：session_start 跨越先前压缩时吸收其摘要', () => {
+test('compress：跨过先前压缩时吸收为链，旧块文本保留且可 expand', () => {
   const { session } = buildAnchorScenario()
   const first = slotSummary({ '已完成': '- 实现 `compress.js` 证据: lib/anchor/compress.js:1' })
-  const all = fullSummary({ '已完成': '- 吸收 `a1`：`compress.js` 实现 证据: lib/anchor/compress.js:1' })
+  // 新摘要只写很薄的内容：链式语义下不再因「没接住定位」被拒。
+  const thin = slotSummary({ '当前任务': '- 继续链式改造 证据: docs/anchor-compression.md:1' })
   compressFromAnchor({ session, tokenMeter, startAnchor: 'a1', summary: first, callId: 'call-compress-1', logger: silentLogger })
+
   appendAssistant(session, { turn: 4, step: 1, text: 'MORE WORK' })
   appendAssistant(session, {
     turn: 5,
@@ -276,42 +285,51 @@ test('compress：session_start 跨越先前压缩时吸收其摘要', () => {
     session,
     tokenMeter,
     startAnchor: 'session_start',
-    summary: all,
-    force: true,
+    summary: thin,
     callId: 'call-compress-2',
     logger: silentLogger,
   })
+  assert.equal(result.blockId, 2)
   assert.equal(result.absorbed, 1)
+  assert.deepEqual(result.absorbedBlockIds, [1])
+  assert.deepEqual(result.chain.map((block) => block.blockId), [1])
+  assert.deepEqual(result.problems, [])
+
   const summaries = derivedShape(session).filter((m) => m.source === 'dcp-compress')
-  assert.deepEqual(summaries.map((m) => m.text), [`[Compressed: session_start → here]\n${all}`])
+  assert.equal(summaries.length, 1)
+  assert.ok(summaries[0].text.startsWith('[Compressed: session_start → here] (block 2)'))
+  assert.ok(summaries[0].text.includes(thin))
+  assert.ok(summaries[0].text.includes('已并入本块的旧压缩块（索引，全文未丢失）:'))
+  assert.ok(summaries[0].text.includes('- 块 1「a1」：测试上下文压缩 — 全文: expand({block: 1})'))
+
+  // 被吸收的块不在表面，但日志里仍在，expand 取回全文。
+  const expanded = expandBlock({ session, block: 1 })
+  assert.equal(expanded.block, 1)
+  assert.ok(expanded.content.includes('[block 1「a1」 — 全文]'))
+  assert.ok(expanded.content.includes(first))
+  assert.ok(!expanded.content.includes('更深一层'))
+
+  const expanded2 = expandBlock({ session, block: 2 })
+  assert.ok(expanded2.content.includes('更深一层（索引）:'))
+  assert.ok(expanded2.content.includes('- 块 1「a1」：测试上下文压缩 — 全文: expand({block: 1})'))
 })
 
-test('compress：吸收旧块时丢失其定位会被拒绝（基线继承）', () => {
-  const { session } = buildAnchorScenario()
-  const first = slotSummary({ '已完成': '- 实现 `summary.js` 证据: lib/anchor/summary.js:1' })
-  compressFromAnchor({ session, tokenMeter, startAnchor: 'a1', summary: first, callId: 'call-compress-1', logger: silentLogger })
-  appendAssistant(session, { turn: 4, step: 1, text: 'MORE WORK' })
-  appendAssistant(session, {
-    turn: 5,
-    step: 1,
-    calls: [{ callId: 'call-compress-2', name: 'compress', args: {} }],
-  })
+test('compress：摘要只做 advisory 提示，不拒绝压缩', () => {
+  const { session, compressCallId } = buildAnchorScenario()
+  const summary = '先做 A，然后做 B\n证据: notes.md:4'
   const before = session.seq
-  // 新摘要接住了 已完成 的定位（`summary.js`），但丢了 `summary.js` 之外的
-  // 旧块定位才会被拒；这里故意只保留一条与旧块无关的定位。
-  assert.throws(
-    () => compressFromAnchor({
-      session,
-      tokenMeter,
-      startAnchor: 'session_start',
-      summary: fullSummary({ '已完成': '- 完成别处工作 证据: test/anchor-tests.mjs:1' }),
-      force: true,
-      callId: 'call-compress-2',
-      logger: silentLogger,
-    }),
-    /基线继承/,
-  )
-  assert.equal(session.seq, before)
+  const result = compressFromAnchor({
+    session,
+    tokenMeter,
+    startAnchor: 'a1',
+    summary,
+    callId: compressCallId,
+    logger: silentLogger,
+  })
+  assert.ok(result.problems.length > 0)
+  assert.equal(session.seq, before + 2)
+  assert.equal(derivedShape(session).filter((m) => m.source === 'dcp-compress')[0].text,
+    `[Compressed: a1 → here] (block 1)\n${summary}`)
 })
 
 test('compress：未知锚点列出可用锚点；已消耗锚点给出专门错误', () => {
@@ -349,7 +367,7 @@ test('compress：空区间报错（锚点与 compress 同一 assistant 消息）
     /contains no messages to compress/,
   )
   assert.throws(
-    () => compressFromAnchor({ session, tokenMeter, startAnchor: 'session_start', summary: fullSummary(), force: true, callId: 'call-compress-1', logger: silentLogger }),
+    () => compressFromAnchor({ session, tokenMeter, startAnchor: 'session_start', summary: slotSummary(), callId: 'call-compress-1', logger: silentLogger }),
     /contains no messages to compress/,
   )
 })
@@ -428,7 +446,7 @@ test('compress：区间跨过 system-prompt 更新时拒绝（不允许遮蔽 in
     /crosses a system-prompt update/,
   )
   assert.throws(
-    () => compressFromAnchor({ session, tokenMeter, startAnchor: 'session_start', summary: fullSummary(), force: true, callId: 'call-compress-1', logger: silentLogger }),
+    () => compressFromAnchor({ session, tokenMeter, startAnchor: 'session_start', summary: slotSummary(), callId: 'call-compress-1', logger: silentLogger }),
     /crosses a system-prompt update/,
   )
   assert.equal(session.seq, before)
@@ -454,7 +472,6 @@ test('compress：校验失败不产生任何事件', () => {
   const { session, compressCallId } = buildAnchorScenario()
   const before = session.seq
   assert.throws(() => compressFromAnchor({ session, tokenMeter, startAnchor: 'missing', summary: slotSummary(), callId: compressCallId, logger: silentLogger }))
-  assert.throws(() => compressFromAnchor({ session, tokenMeter, startAnchor: 'session_start', summary: slotSummary(), callId: compressCallId, logger: silentLogger }))
   assert.equal(session.seq, before)
   assert.equal(session.surface.replaceGeneration, 0)
 })
@@ -464,4 +481,15 @@ test('scanAllAnchorCalls：包含已消耗锚点的全量记录', () => {
   assert.deepEqual(scanAllAnchorCalls(session.snapshotEvents()).map((a) => a.name), ['a1'])
   compressFromAnchor({ session, tokenMeter, startAnchor: 'a1', summary: slotSummary(), callId: 'call-compress-1', logger: silentLogger })
   assert.deepEqual(scanAllAnchorCalls(session.snapshotEvents()).map((a) => a.name), ['a1'])
+})
+
+test('scanCompressionBlocks：从日志重导出块，blockId 与 source 一致', () => {
+  const { session } = buildAnchorScenario()
+  compressFromAnchor({ session, tokenMeter, startAnchor: 'a1', summary: slotSummary(), callId: 'call-compress-1', logger: silentLogger })
+  const blocks = scanCompressionBlocks(session.snapshotEvents())
+  assert.equal(blocks.length, 1)
+  assert.equal(blocks[0].blockId, 1)
+  assert.equal(blocks[0].anchor, 'a1')
+  assert.equal(blocks[0].startToolCallId, 'call-anchor-1')
+  assert.deepEqual(blocks[0].parentIds, [])
 })
